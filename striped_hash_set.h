@@ -3,21 +3,24 @@
 #include <vector>
 #include <forward_list>
 #include <atomic>
+#include <algorithm>
 
 template<class T, class Hash = std::hash<T> >
 class striped_hash_set
 {
+    typedef std::forward_list<T>& listref;
+    typedef const std::forward_list<T>& clistref;
 public:
     striped_hash_set (
                         size_t mutexNum_ = 1,
-                        double growthFactor_ = 2.,
+                        size_t growthFactor_ = 2,
                         double loadFactor_ = 100.
                      )
                      : growthFactor(growthFactor_),
                        loadFactor(loadFactor_),
                        locks(mutexNum_),
                        elementsNum(0),
-                       table(4 * mutexNum_)
+                       table(67 * mutexNum_)
     {}
     void add(const T& elem);
     void remove(const T& elem);
@@ -25,10 +28,9 @@ public:
 private:
     size_t get_bucket_index(size_t hash_value) const;
     size_t get_stripe_index(size_t hash_value) const;
-    Hash hash_func;
-    double growthFactor;
-    double loadFactor;
-    std::vector<std::mutex> locks;
+    const size_t growthFactor;
+    const double loadFactor;
+    mutable std::vector<std::mutex> locks;
     std::atomic<size_t> elementsNum;
     std::vector<std::forward_list<T> > table;
 };
@@ -38,7 +40,9 @@ void striped_hash_set<T, Hash>::add(const T& elem)
 {
     size_t hash_value = Hash()(elem);
     std::unique_lock<std::mutex> ul(locks[get_stripe_index(hash_value)]);
-    auto bucket = table[get_bucket_index(hash_value)];
+    listref bucket = table[get_bucket_index(hash_value)];
+    if(std::find(bucket.begin(), bucket.end(), elem) != bucket.end())
+        return;
     bucket.push_front(elem);
     if (static_cast<double>(elementsNum.fetch_add(1)) / table.size() >= loadFactor)
     {
@@ -50,13 +54,13 @@ void striped_hash_set<T, Hash>::add(const T& elem)
         {
             for(size_t i = 1; i < locks.size(); ++i)
                 ulocks.emplace_back(locks[i]);
-            std::vector<std::forward_list<T> > oldTable = table;
-            size_t size = static_cast<size_t>(growthFactor * table.size());
+            auto oldTable = table;
+            size_t size = growthFactor * table.size();
             table.clear();
             table.resize(size);
             for(const auto& buck : oldTable)
                 for(const auto& elm : buck)
-                    table[hash_value % size].push_front(elm);
+                    table[Hash()(elm) % size].push_front(elm);
         }
     }
 }
@@ -66,8 +70,9 @@ void striped_hash_set<T, Hash>::remove(const T& elem)
 {
     size_t hash_value = Hash()(elem);
     std::unique_lock<std::mutex> ul(locks[get_stripe_index(hash_value)]);
-    auto bucket = table[get_bucket_index(hash_value)];
+    listref bucket = table[get_bucket_index(hash_value)];
     bucket.remove(elem);
+    elementsNum.fetch_sub(1);
 }
 
 template<class T, class Hash>
@@ -75,7 +80,7 @@ bool striped_hash_set<T, Hash>::contains(const T& elem) const
 {
     size_t hash_value = Hash()(elem);
     std::unique_lock<std::mutex> ul(locks[get_stripe_index(hash_value)]);
-    auto bucket = table[get_bucket_index(hash_value)];
+    clistref bucket = table[get_bucket_index(hash_value)];
     return std::find(bucket.begin(), bucket.end(), elem) != bucket.end();
 }
 
